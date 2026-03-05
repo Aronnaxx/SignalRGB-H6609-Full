@@ -109,21 +109,37 @@ function GetRGBFromSubdevices(){
 }
 
 function GetDeviceRGB(){
+
 	const RGBData = new Array(ledCount * 3);
 
 	for(let i = 0 ; i < ledPositions.length; i++){
-		const ledPosition = ledPositions[i];
-		let color;
 
-		if (LightingMode === "Forced") {
-			color = hexToRgb(forcedColor);
-		} else {
-			color = device.color(ledPosition[0], ledPosition[1]);
+		const pos = ledPositions[i];
+
+		let r = 0;
+		let g = 0;
+		let b = 0;
+		let samples = 0;
+
+		for(let dx=-1; dx<=1; dx++){
+			for(let dy=-1; dy<=1; dy++){
+
+				const x = pos[0] + dx;
+				const y = pos[1] + dy;
+
+				const color = device.color(x,y);
+
+				r += color[0];
+				g += color[1];
+				b += color[2];
+
+				samples++;
+			}
 		}
 
-		RGBData[i * 3] = color[0];
-		RGBData[i * 3 + 1] = color[1];
-		RGBData[i * 3 + 2] = color[2];
+		RGBData[i*3] = Math.floor(r/samples);
+		RGBData[i*3+1] = Math.floor(g/samples);
+		RGBData[i*3+2] = Math.floor(b/samples);
 	}
 
 	return RGBData;
@@ -160,7 +176,7 @@ function fetchDeviceInfoFromTableAndConfigure() {
 }
 
 function SetLedCount(count){
-	ledCount = count;
+	ledCount = 10;
 
 	CreateLedMap();
 	device.setSize([36, 18]);
@@ -175,19 +191,40 @@ function CreateLedMap(){
 	const width = 36;
 	const height = 18;
 
-	let index = 1;
+	// Левый верх
+	ledNames.push("Led 1");
+	ledPositions.push([0, height-1]);
 
-	for(let y = 0; y < height; y++){
-		for(let x = 0; x < width; x++){
+	// Левая сторона
+	ledNames.push("Led 2");
+	ledPositions.push([0, Math.floor(height*0.6)]);
 
-			ledNames.push(`Led ${index}`);
-			ledPositions.push([x, y]);
+	ledNames.push("Led 3");
+	ledPositions.push([0, Math.floor(height*0.3)]);
 
-			index++;
-		}
-	}
+	// Низ
+	ledNames.push("Led 4");
+	ledPositions.push([Math.floor(width*0.2), 0]);
 
-	ledCount = width * height;
+	ledNames.push("Led 5");
+	ledPositions.push([Math.floor(width*0.4), 0]);
+
+	ledNames.push("Led 6");
+	ledPositions.push([Math.floor(width*0.6), 0]);
+
+	// Правая сторона
+	ledNames.push("Led 7");
+	ledPositions.push([width-1, Math.floor(height*0.3)]);
+
+	ledNames.push("Led 8");
+	ledPositions.push([width-1, Math.floor(height*0.6)]);
+
+	// Верх
+	ledNames.push("Led 9");
+	ledPositions.push([Math.floor(width*0.6), height-1]);
+
+	ledNames.push("Led 10");
+	ledPositions.push([Math.floor(width*0.3), height-1]);
 }
 
 function ClearSubdevices(){
@@ -1265,4 +1302,5 @@ const GoveeDeviceLibrary = {
 			},
 		]
 	}
+
 };
