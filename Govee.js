@@ -109,37 +109,21 @@ function GetRGBFromSubdevices(){
 }
 
 function GetDeviceRGB(){
-
 	const RGBData = new Array(ledCount * 3);
 
 	for(let i = 0 ; i < ledPositions.length; i++){
+		const ledPosition = ledPositions[i];
+		let color;
 
-		const pos = ledPositions[i];
-
-		let r = 0;
-		let g = 0;
-		let b = 0;
-		let samples = 0;
-
-		for(let dx=-1; dx<=1; dx++){
-			for(let dy=-1; dy<=1; dy++){
-
-				const x = pos[0] + dx;
-				const y = pos[1] + dy;
-
-				const color = device.color(x,y);
-
-				r += color[0];
-				g += color[1];
-				b += color[2];
-
-				samples++;
-			}
+		if (LightingMode === "Forced") {
+			color = hexToRgb(forcedColor);
+		} else {
+			color = device.color(ledPosition[0], ledPosition[1]);
 		}
 
-		RGBData[i*3] = Math.floor(r/samples);
-		RGBData[i*3+1] = Math.floor(g/samples);
-		RGBData[i*3+2] = Math.floor(b/samples);
+		RGBData[i * 3] = color[0];
+		RGBData[i * 3 + 1] = color[1];
+		RGBData[i * 3 + 2] = color[2];
 	}
 
 	return RGBData;
@@ -176,55 +160,23 @@ function fetchDeviceInfoFromTableAndConfigure() {
 }
 
 function SetLedCount(count){
-	ledCount = 10;
+	ledCount = count;
 
 	CreateLedMap();
-	device.setSize([36, 18]);
+	device.setSize([4, 3]);
 	device.setControllableLeds(ledNames, ledPositions);
 }
 
 function CreateLedMap(){
-
 	ledNames = [];
-	ledPositions = [];
+	ledPositions = [[0, 2], [0, 1], [0, 0], [1, 0], [2, 0], [3, 0], [3, 1], [3, 2], [2, 2], [1, 2]];
 
-	const width = 36;
-	const height = 18;
 
-	// Левый верх
-	ledNames.push("Led 1");
-	ledPositions.push([0, height-1]);
 
-	// Левая сторона
-	ledNames.push("Led 2");
-	ledPositions.push([0, Math.floor(height*0.6)]);
-
-	ledNames.push("Led 3");
-	ledPositions.push([0, Math.floor(height*0.3)]);
-
-	// Низ
-	ledNames.push("Led 4");
-	ledPositions.push([Math.floor(width*0.2), 0]);
-
-	ledNames.push("Led 5");
-	ledPositions.push([Math.floor(width*0.4), 0]);
-
-	ledNames.push("Led 6");
-	ledPositions.push([Math.floor(width*0.6), 0]);
-
-	// Правая сторона
-	ledNames.push("Led 7");
-	ledPositions.push([width-1, Math.floor(height*0.3)]);
-
-	ledNames.push("Led 8");
-	ledPositions.push([width-1, Math.floor(height*0.6)]);
-
-	// Верх
-	ledNames.push("Led 9");
-	ledPositions.push([Math.floor(width*0.6), height-1]);
-
-	ledNames.push("Led 10");
-	ledPositions.push([Math.floor(width*0.3), height-1]);
+	for(let i = 0; i < ledCount; i++){
+		ledNames.push(`Led ${i + 1}`);
+//		ledPositions.push([i, 0]);
+	}
 }
 
 function ClearSubdevices(){
@@ -842,8 +794,10 @@ const GoveeDeviceLibrary = {
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 648,
-		size: [36,18],
+		ledCount: 10,
+		size: [4,3],
+		ledNames: [ "Led1", "Led2", "Led3", "Led4", "Led5", "Led6", "Led7", "Led8", "Led9", "Led10", "Led10" ],
+		ledPositions: [[0, 2], [0, 1], [0, 0], [1, 0], [2, 0], [3, 0], [3, 1], [3, 2], [2, 2], [1, 2]]
 	},
 	H610A: {
 		name: "Glide Lively Wall Light",
@@ -1302,5 +1256,4 @@ const GoveeDeviceLibrary = {
 			},
 		]
 	}
-
 };
