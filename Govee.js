@@ -64,8 +64,12 @@ export function Initialize(){
 	govee.setDeviceState(true);
 }
 
+/** @type {number[]} */
+let prevRGBData = null; // Хранит предыдущие цвета
+const smoothFactor = 0.1; // 0 < smoothFactor <= 1, чем меньше — тем плавнее
 export function Render(){
-	const RGBData = subdevices.length > 0 ? GetRGBFromSubdevices() : GetDeviceRGB();
+	const targetRGB = subdevices.length > 0 ? GetRGBFromSubdevices() : GetDeviceRGB();
+	const RGBData = smoothRGB(targetRGB);
 
 	govee.SendRGB(RGBData);
 	device.pause(10);
@@ -209,6 +213,21 @@ function hexToRgb(hex) {
 	colors[2] = parseInt(result[3], 16);
 
 	return colors;
+}
+
+function smoothRGB(targetRGB) {
+	if(!prevRGBData) {
+		prevRGBData = targetRGB.slice();
+		return targetRGB;
+	}
+
+	const smoothed = [];
+	for(let i = 0; i < targetRGB.length; i++) {
+		const diff = targetRGB[i] - prevRGBData[i];
+		prevRGBData[i] += diff * smoothFactor;
+		smoothed[i] = Math.round(prevRGBData[i]);
+	}
+	return smoothed;
 }
 
 let UDPServer;
@@ -1256,4 +1275,5 @@ const GoveeDeviceLibrary = {
 			},
 		]
 	}
+
 };
