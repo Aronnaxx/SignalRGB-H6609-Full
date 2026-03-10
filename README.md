@@ -15,4 +15,6 @@ MAKE SURE TO DISABLE THE ORIGINAL GOVEE PLUG-IN!!
 Click the button above and allow signalrgb to install this extension when prompted.
 
 ## Support
-Sorry none... I barely know how to program and have no formal training. Just wanted to fix the light for myself.
+None really, but this does match from the above. Forked from a a different repo (see commits), saving for future
+
+<img width="995" height="647" alt="image" src="https://github.com/user-attachments/assets/afb79f45-6cf3-4a70-b45d-8a41af02f228" />
