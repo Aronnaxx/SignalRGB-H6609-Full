@@ -2,6 +2,7 @@ import udp from "@SignalRGB/udp";
 export function Name() { return "Govee"; }
 export function Version() { return "1.0.0"; }
 export function Type() { return "network"; }
+export function DeviceType() { return "Lighting"; }
 export function Publisher() { return "WhirlwindFX"; }
 export function Size() { return [22, 1]; }
 export function DefaultPosition() {return [75, 70]; }
@@ -142,7 +143,7 @@ function fetchDeviceInfoFromTableAndConfigure() {
 			device.addProperty({"property": "variableLedCount", label: "Segment Count", "type": "number", "min": 1, "max": 60, default: GoveeDeviceInfo.ledCount, step: 1});
 			SetLedCount(variableLedCount);
 		}else{
-			SetLedCount(GoveeDeviceInfo.ledCount);
+			ConfigureDevice(GoveeDeviceInfo);
 			device.removeProperty("variableLedCount");
 		}
 
@@ -163,23 +164,36 @@ function fetchDeviceInfoFromTableAndConfigure() {
 	}
 }
 
-function SetLedCount(count){
-	ledCount = count;
+function ConfigureDevice(GoveeDeviceInfo){
+	ledCount = GoveeDeviceInfo.ledCount;
 
-	CreateLedMap();
-	device.setSize([4, 3]);
+	if(GoveeDeviceInfo.ledPositions && GoveeDeviceInfo.size){
+		ledPositions = GoveeDeviceInfo.ledPositions;
+		ledNames = GoveeDeviceInfo.ledNames || Array.from({length: ledCount}, (_, i) => `Led ${i + 1}`);
+		device.setSize(GoveeDeviceInfo.size);
+	}else{
+		CreateLedMap(ledCount);
+		device.setSize([ledCount, 1]);
+	}
+
 	device.setControllableLeds(ledNames, ledPositions);
 }
 
-function CreateLedMap(){
+function SetLedCount(count){
+	ledCount = count;
+
+	CreateLedMap(count);
+	device.setSize([count, 1]);
+	device.setControllableLeds(ledNames, ledPositions);
+}
+
+function CreateLedMap(count){
 	ledNames = [];
-	ledPositions = [[0, 2], [0, 1], [0, 0], [1, 0], [2, 0], [3, 0], [3, 1], [3, 2], [2, 2], [1, 2]];
+	ledPositions = [];
 
-
-
-	for(let i = 0; i < ledCount; i++){
+	for(let i = 0; i < count; i++){
 		ledNames.push(`Led ${i + 1}`);
-//		ledPositions.push([i, 0]);
+		ledPositions.push([i, 0]);
 	}
 }
 
@@ -577,6 +591,18 @@ class GoveeProtocol {
 	}
 }
 
+function safeLog(message, opt) {
+	if (typeof service !== "undefined" && typeof service.log === "function") {
+		if (opt !== undefined) {
+			service.log(message, opt);
+		} else {
+			service.log(message);
+		}
+	} else if (typeof device !== "undefined" && typeof device.log === "function") {
+		device.log(message);
+	}
+}
+
 class UdpSocketServer{
 	constructor (args) {
 		this.count = 0;
@@ -599,7 +625,7 @@ class UdpSocketServer{
 	send(packet) {
 		if(!this.server) {
 			this.server = udp.createSocket();
-			device.log("Defining new UDP Socket so we can send data.");
+			safeLog("Defining new UDP Socket so we can send data.");
 		}
 
 		this.server.send(packet);
@@ -629,10 +655,10 @@ class UdpSocketServer{
 	}
 
 	onConnection(){
-		service.log('Connected to remote socket!');
-		service.log("Remote Address:");
-		service.log(this.server.remoteAddress(), {pretty: true});
-		service.log("Sending Check to socket");
+		safeLog('Connected to remote socket!');
+		safeLog("Remote Address:");
+		safeLog(this.server.remoteAddress(), {pretty: true});
+		safeLog("Sending Check to socket");
 
 		const bytesWritten = this.server.send(JSON.stringify({
 			msg: {
@@ -644,32 +670,32 @@ class UdpSocketServer{
 		}));
 
 		if(bytesWritten === -1){
-			service.log('Error sending data to remote socket');
+			safeLog('Error sending data to remote socket');
 		}
 	};
 
 	onListenerResponse(msg) {
-		service.log('Data received from client');
-		service.log(msg, {pretty: true});
+		safeLog('Data received from client');
+		safeLog(msg, {pretty: true});
 	}
 
 	onListening(){
 		const address = this.server.address();
-		service.log(`Server is listening at port ${address.port}`);
+		safeLog(`Server is listening at port ${address.port}`);
 
 		// Check if the socket is bound (no error means it's bound but we'll check anyway)
-		service.log(`Socket Bound: ${this.server.state === this.server.BoundState}`);
+		safeLog(`Socket Bound: ${this.server.state === this.server.BoundState}`);
 	};
 	onMessage(msg){
-		service.log('Data received from client');
-		service.log(msg, {pretty: true});
+		safeLog('Data received from client');
+		safeLog(msg, {pretty: true});
 
-		if(this.isDiscoveryServer) {
+		if(this.isDiscoveryServer && typeof discovery !== "undefined" && typeof discovery.forceDiscovery === "function") {
 			discovery.forceDiscovery(msg);
 		}
 	};
 	onError(code, message){
-		service.log(`Error: ${code} - ${message}`);
+		safeLog(`Error: ${code} - ${message}`);
 		//this.server.close(); // We're done here
 	};
 }
@@ -815,7 +841,7 @@ const GoveeDeviceLibrary = {
 		supportDreamView: true,
 		ledCount: 10,
 		size: [4,3],
-		ledNames: [ "Led1", "Led2", "Led3", "Led4", "Led5", "Led6", "Led7", "Led8", "Led9", "Led10", "Led10" ],
+		ledNames: [ "Led 1", "Led 2", "Led 3", "Led 4", "Led 5", "Led 6", "Led 7", "Led 8", "Led 9", "Led 10" ],
 		ledPositions: [[0, 2], [0, 1], [0, 0], [1, 0], [2, 0], [3, 0], [3, 1], [3, 2], [2, 2], [1, 2]]
 	},
 	H610A: {
