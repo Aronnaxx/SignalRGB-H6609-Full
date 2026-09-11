@@ -2,38 +2,115 @@ import udp from "@SignalRGB/udp";
 export function Name() { return "Govee"; }
 export function Version() { return "1.0.0"; }
 export function Type() { return "network"; }
-export function DeviceType() { return "Lighting"; }
 export function Publisher() { return "WhirlwindFX"; }
 export function Size() { return [22, 1]; }
-export function DefaultPosition() {return [75, 70]; }
-export function DefaultScale() {return 8.0;}
 
+// False, with SetIsSubdeviceController called per device instead. Only 5 of the ~68 library
+// entries are built from separate physical pieces; declaring every Govee light a subdevice
+// controller made bulbs and single-segment strips ask to be configured before they would light.
+export function SubdeviceController() { return false; }
 /* global
 controller:readonly
 discovery: readonly
-TurnOffOnShutdown:readonly
-variableLedCount:readonly
+shutdownColor:readonly
 LightingMode:readonly
 forcedColor:readonly
+TurnOffOnShutdown:readonly
+protocolSelect:readonly
+blendSegments:readonly
+variableLedCount:readonly
+streamKeepalive:readonly
+statusQuery:readonly
 */
 export function ControllableParameters() {
 	return [
-		{"property":"TurnOffOnShutdown", "group":"settings", "label":"Turn off on App Exit", "type":"boolean", "default":"false"},
-		{"property":"LightingMode", "group":"lighting", "label":"Lighting Mode", "type":"combobox", "values":["Canvas", "Forced"], "default":"Canvas"},
-		{"property":"forcedColor", "group":"lighting", "label":"Forced Color", "min":"0", "max":"360", "type":"color", "default":"#009bde"},
+		{property:"shutdownColor", group:"lighting", label:"Shutdown Color", description: "This color is applied to the device when the System, or SignalRGB is shutting down", min:"0", max:"360", type:"color", default:"#000000"},
+		{property:"LightingMode", group:"lighting", label:"Lighting Mode", description: "Determines where the device's RGB comes from. Canvas will pull from the active Effect, while Forced will override it to a specific color", type:"combobox", values:["Canvas", "Forced"], default:"Canvas"},
+		{property:"forcedColor", group:"lighting", label:"Forced Color", description: "The color used when 'Forced' Lighting Mode is enabled", min:"0", max:"360", type:"color", default:"#009bde"},
+		{property:"TurnOffOnShutdown", group:"settings", label:"Turn off when ignored", description: "This turns off the device when it is ignored or disabled, and when the app shuts down", type:"boolean", default:"false"},
+		{property:"protocolSelect", group:"settings", label:"Protocol", description: "Determines which protocol will be used to control the device. Auto picks the best protocol this device is known to support, and is the right choice unless you're troubleshooting. (Not all protocols works on a device)", type:"combobox", values:["Auto", "Dreamview", "RazerV1", "RazerV2", "Static"], default:"Auto"},
+		{property:"blendSegments", group:"settings", label:"Blend Between Segments", description: "Lets the device fade between the colors we send instead of applying each one to its own segment. Auto follows what the device library says. Softer on a strip, wrong on anything built from separate physical pieces like a curtain, where it blends across a gap that is not there in the light.", type:"combobox", values:["Auto", "On", "Off"], default:"Auto"},
+		// TEMPORARY, both of these. They exist to settle whether stream mode really auto-disables in
+		// the firmware, which is the only thing that ever justified paying a dropped frame on a timer.
+		// Remove both once that is known -- see the comment on MaintainStreamingMode.
+		{property:"streamKeepalive", group:"settings", label:"Stream Keepalive (test)", description: "How stream mode is kept alive. Sending the stream mode command costs a dropped frame on the device, so 'On loss only' sends it just when the device stops answering. 'Never' never re-sends it after startup. 'Timer 40s' is the old behaviour, kept only so the two can be compared on the bench.", type:"combobox", values:["On loss only", "Never", "Timer 40s"], default:"On loss only"},
+		{property:"statusQuery", group:"settings", label:"Status Query (test)", description: "Whether to send the once-a-second status query in among the colour frames. Its replies are what tell us the device is still listening, but the query is also the main suspect for knocking the device out of stream mode in the first place. Turning it off removes both.", type:"boolean", default:"true"},
 	];
 }
 
-export function SubdeviceController() { return false; }
-
 /** @type {GoveeProtocol} */
 let govee;
-let ledCount = 4;
+
+// Matches what shipped before the components rewrite. A device we cannot identify gets a
+// modest strip rather than a large one: too few LEDs renders a coarse version of the effect,
+// while too many silently pushes past what the device accepts -- and above roughly 20 some
+// devices blank entirely rather than clamping.
+const UnknownSkuLedCount = 20;
+
+/** The device's LED layout, as handed to setControllableLeds. Rebuilt by SetLedCount whenever
+ * the count changes, and the source of truth for how many colors go on the wire. */
+let ledCount = 0;
 let ledNames = [];
 let ledPositions = [];
+
+/** Populated only for library entries with usesSubDevices -- devices built from separate
+ * physical pieces, where each piece is placed on the canvas independently.
+ * @type {{id: string, name: string, ledCount: number, size: number[], ledNames: string[], ledPositions: number[][]}[]} */
 let subdevices = [];
 
+/** Protocol used while protocolSelect is left on "Auto". Resolved per device from the
+ * library, so a device only ever gets a protocol it's known to support. */
+let autoProtocol = "Static";
+
+/** Reset per Initialize so the first outbound frame is logged once. Initialize completing
+ * does not mean Render is running, and the two failure modes look identical on the device. */
+let loggedFirstFrame = false;
+
+/** Frames since Initialize. Logged periodically so a render loop that never starts, or one
+ * that starts and later stops, is visible instead of silent. */
+let renderCount = 0;
+
+/** Whether the socket has been seen connected since Initialize, so the setup commands can be
+ * asserted once it actually is. */
+let sawConnectedSocket = false;
+
+/** So the "not initialized yet" warning is logged once rather than every frame. */
+let loggedMissingProtocol = false;
+
+/** Whether this device should let the firmware fade between the colors we send. Seeded from the
+ * library per device, since whether blending helps depends on the device being one continuous run
+ * of LEDs rather than several separate pieces. */
+let blendByDefault = true;
+
+/** When the device last answered us. Every status reply updates it, and silence is the only
+ * evidence we have that stream mode was lost. Zero means it has never answered, so nothing is
+ * judged lost before the first reply arrives. */
+let lastStatusReply = 0;
+
+/** How long the device may go unanswering before stream mode is treated as lost. The status query
+ * goes out about once a second, so this is several missed replies rather than one dropped
+ * datagram -- UDP loses the odd packet and that is not worth a dropped frame. */
+const StreamLostAfter = 5000;
+
+/** So the state of the liveness channel is logged on transitions rather than once a second. */
+let loggedFirstStatusReply = false;
+let loggedNoStatusReplies = false;
+let streamLooksLost = false;
+
+/** Only reachable through the "Timer 40s" test setting. Not a path worth keeping -- see
+ * MaintainStreamingMode. */
+const StreamingAssertInterval = 40000;
+let lastStreamingAssert = 0;
+
 export function Initialize(){
+	loggedFirstFrame = false;
+	renderCount = 0;
+	sawConnectedSocket = false;
+	lastStreamingAssert = 0;
+	lastStatusReply = 0;
+	loggedFirstStatusReply = false;
+	loggedNoStatusReplies = false;
+	streamLooksLost = false;
 	device.addFeature("base64");
 
 	device.setName(controller.sku);
@@ -48,119 +125,239 @@ export function Initialize(){
 	UDPServer = new UdpSocketServer({
 		ip : controller.ip,
 		broadcastPort : 4003,
-		listenPort : 4002
 	});
 
 	UDPServer.start();
 	//Establish a new udp server. This is now required for using udp.send.
 
+	// The device answers us, and until now nothing listened. Its replies are the only way to tell a
+	// device that is still streaming from one that has silently stopped accepting frames.
+	UDPServer.setCallbackFunction(OnDeviceResponse);
+
+	// Subdevices survive a reload, so they have to be torn down before the layout is rebuilt or
+	// a device accumulates a fresh set on every Initialize.
 	ClearSubdevices();
 	fetchDeviceInfoFromTableAndConfigure();
 
 	govee = new GoveeProtocol(controller.ip, controller.supportDreamView, controller.supportRazer);
-	// This is what happens in my wireshark
+
 	govee.setDeviceState(true);
-	govee.SetRazerMode(true);
-	govee.SetRazerMode(true);
-	govee.setDeviceState(true);
+	govee.SetStreamingMode(true);
 }
 
-/** @type {number[]} */
-let prevRGBData = null; // Хранит предыдущие цвета
-const smoothFactor = 0.1; // 0 < smoothFactor <= 1, чем меньше — тем плавнее
 export function Render(){
-	const targetRGB = subdevices.length > 0 ? GetRGBFromSubdevices() : GetDeviceRGB();
-	const RGBData = smoothRGB(targetRGB);
+	// Initialize assigns govee only after fetchDeviceInfoFromTableAndConfigure has run, so if that
+	// throws -- or Render is reached before Initialize at all -- govee is undefined and every call
+	// below fails with "Cannot read property of undefined". Bail instead of throwing once per frame.
+	if(govee === undefined){
+		if(!loggedMissingProtocol){
+			loggedMissingProtocol = true;
+			device.log("Render called before the device finished initializing. Nothing to send yet.");
+		}
 
-	govee.SendRGB(RGBData);
+		return;
+	}
+
+	// Uncomment to trace the render loop. Distinguishes a loop that never starts from one
+	// that starts and later stops -- neither is otherwise visible, since a device holds its
+	// last color rather than going dark.
+	// if(renderCount % 300 === 0){
+	// 	device.log(`Render tick ${renderCount}.`);
+	// }
+
+	// Initialize starts the socket and then sends the setup commands straight away, before
+	// connect() has reported back, so they can go out on a socket that is not ready yet.
+	// Watch for the connection landing instead and assert them then. A flag check per frame,
+	// no blocking, and it works no matter how long the socket takes.
+	if(!sawConnectedSocket && UDPServer !== undefined && UDPServer.connected){
+		sawConnectedSocket = true;
+		govee.setDeviceState(true);
+		govee.SetStreamingMode(true);
+	}
+
+	MaintainStreamingMode();
+
+	renderCount++;
+
+	govee.SendRGB();
 	device.pause(10);
 }
 
-export function Shutdown(suspend){
-	govee.SetRazerMode(false);
+/** Re-asserts stream mode, but only where there is a reason to.
+ *
+ * Every 0xB1 costs a dropped frame on the device -- confirmed on hardware -- and it cannot be
+ * papered over by resending the colour frame, because Render already sends one in the same tick
+ * with no pause between them and the device drops it anyway. So the device is discarding whatever
+ * arrives while it re-enters stream mode, which makes the interval untunable: the only acceptable
+ * number of scheduled asserts is none. That is what shipped as flicker twice, at 150 frames and
+ * then at 40 seconds.
+ *
+ * The evidence that stream mode was lost is the device going quiet. It answers the status query
+ * SendEncodedPacket sends, so replies arriving mean it is still on the other end; silence past
+ * StreamLostAfter means it is not, and that is the one case worth a dropped frame.
+ *
+ * The two other modes are temporary, and exist to settle whether the firmware really has the one
+ * minute auto-disable the protocol reference claims. It has never been measured, and the bench
+ * result it rests on has a competing explanation -- the status query itself dropping the device out
+ * of stream mode -- so both halves have to be switchable to tell them apart. Delete them, and the
+ * settings that drive them, once that is known. */
+function MaintainStreamingMode(){
+	if(streamKeepalive === "Never"){
+		return;
+	}
+
+	// The old behaviour, kept only for bench comparison. Flashes every 40 seconds by design.
+	if(streamKeepalive === "Timer 40s"){
+		const now = Date.now();
+
+		if(now - lastStreamingAssert > StreamingAssertInterval){
+			lastStreamingAssert = now;
+			govee.SetStreamingMode(true);
+		}
+
+		return;
+	}
+
+	// Nothing to judge while the query that produces the replies is switched off. Assert on connect
+	// is all that is left in that configuration, which is the point of being able to switch it off.
+	if(!statusQuery){
+		return;
+	}
+
+	if(lastStatusReply === 0){
+		// Never answered at all. Worth saying once, because it means this device gives us no
+		// liveness signal and the protocol's status command may simply be named something else --
+		// the LAN API documents devStatus, and we send "status".
+		if(!loggedNoStatusReplies && renderCount > 600){
+			loggedNoStatusReplies = true;
+			device.log("Device has never answered a status query, so stream mode cannot be watched on it. It will only be asserted on connect.");
+		}
+
+		return;
+	}
+
+	if(Date.now() - lastStatusReply < StreamLostAfter){
+		return;
+	}
+
+	device.log(`Device has not answered for ${StreamLostAfter}ms. Treating stream mode as lost and re-asserting it once.`);
+	streamLooksLost = true;
+	// Restart the clock, or a device that stays quiet gets an assert every single frame.
+	lastStatusReply = Date.now();
+	govee.SetStreamingMode(true);
+}
+
+/** Handles a reply from the device. Nothing listened to these before -- setCallbackFunction existed
+ * and nothing ever called it -- so a device that had silently stopped accepting frames looked
+ * identical to one that was streaming fine.
+ *
+ * The valuable part is simply that a reply arrived. Reading the body is a bonus: a device that has
+ * been turned off elsewhere will not show our frames whatever we send it. */
+function OnDeviceResponse(msg){
+	const now = Date.now();
+	const silence = lastStatusReply === 0 ? 0 : now - lastStatusReply;
+
+	lastStatusReply = now;
+
+	if(!loggedFirstStatusReply){
+		loggedFirstStatusReply = true;
+		device.log("Device is answering status queries, so stream mode can be watched instead of re-asserted blindly.");
+	}
+
+	if(streamLooksLost){
+		streamLooksLost = false;
+		device.log(`Device is answering again after ${silence}ms of silence.`);
+	}
+
+	// The reply may arrive as the raw datagram or wrapped the way discovery responses are, so accept
+	// either rather than assuming a shape we have not confirmed on this socket.
+	const payload = typeof msg === "string" ? msg : msg?.response;
+
+	if(payload === undefined){
+		return;
+	}
+
+	let reply;
+
+	try{
+		reply = JSON.parse(payload);
+	}catch(e){
+		device.log(`Could not parse a reply from the device: ${e}`);
+
+		return;
+	}
+
+	if(reply?.msg?.data?.onOff === 0){
+		device.log("Device reports it is switched off. It will not show streamed frames until it is on again.");
+	}
+}
+
+export function Shutdown(SystemSuspending){
+	// Shutdown runs on paths where Initialize never completed -- a device that failed to come up,
+	// or a reload racing teardown -- so govee can be undefined here. Throwing in Shutdown is
+	// particularly bad: the host discards the result on the app-exit path, so it surfaces as the
+	// shutdown color silently not applying rather than as an error.
+	if(govee === undefined){
+		return;
+	}
+
+	// Hand control back to the device first. Anything streamed at it before this point is
+	// discarded along with the stream, which is why the shutdown color never stuck.
+	govee.SetStreamingMode(false);
 
 	if(TurnOffOnShutdown){
 		govee.setDeviceState(false);
-	}
-}
 
-export function onvariableLedCountChanged(){
-	SetLedCount(variableLedCount);
-}
-
-function GetRGBFromSubdevices(){
-	const RGBData = [];
-
-	for(const subdevice of subdevices){
-		const ledPositions = subdevice.ledPositions;
-
-		for(let i = 0 ; i < ledPositions.length; i++){
-			const ledPosition = ledPositions[i];
-			let color;
-
-			if (LightingMode === "Forced") {
-				color = hexToRgb(forcedColor);
-			} else {
-				color = device.subdeviceColor(subdevice.id, ledPosition[0], ledPosition[1]);
-			}
-
-			RGBData[i * 3] = color[0];
-			RGBData[i * 3 + 1] = color[1];
-			RGBData[i * 3 + 2] = color[2];
-		}
+		return;
 	}
 
-	return RGBData;
-}
-
-function GetDeviceRGB(){
-	const RGBData = new Array(ledCount * 3);
-
-	for(let i = 0 ; i < ledPositions.length; i++){
-		const ledPosition = ledPositions[i];
-		let color;
-
-		if (LightingMode === "Forced") {
-			color = hexToRgb(forcedColor);
-		} else {
-			color = device.color(ledPosition[0], ledPosition[1]);
-		}
-
-		RGBData[i * 3] = color[0];
-		RGBData[i * 3 + 1] = color[1];
-		RGBData[i * 3 + 2] = color[2];
-	}
-
-	return RGBData;
+	// colorwc sets the device's own state, so it survives us going away. Color properties
+	// arrive as objects rather than hex strings, so the conversion goes through
+	// createColorArray like everywhere else. SendStaticColor skips SetStaticColor's
+	// render-loop pause, which has no business running while the device is being torn down.
+	const color = SystemSuspending ? "#000000" : shutdownColor;
+	govee.SendStaticColor(device.createColorArray(color, 1, "Inline"));
 }
 
 function fetchDeviceInfoFromTableAndConfigure() {
-	if(GoveeDeviceLibrary.hasOwnProperty(controller.sku)){
-		const GoveeDeviceInfo = GoveeDeviceLibrary[controller.sku];
-		device.setName(`Govee ${GoveeDeviceInfo.name}`);
-
-		if(GoveeDeviceInfo.hasVariableLedCount){
-			device.addProperty({"property": "variableLedCount", label: "Segment Count", "type": "number", "min": 1, "max": 60, default: GoveeDeviceInfo.ledCount, step: 1});
-			SetLedCount(variableLedCount);
-		}else{
-			ConfigureDevice(GoveeDeviceInfo);
-			device.removeProperty("variableLedCount");
-		}
-
-		if(GoveeDeviceInfo.usesSubDevices){
-			device.SetIsSubdeviceController(true);
-
-			for(const subdevice of GoveeDeviceInfo.subdevices){
-				CreateSubDevice(subdevice);
-			}
-		}else{
-			device.SetIsSubdeviceController(false);
-		}
-
-	}else{
-		device.log("Using Default Layout...");
+	if(!GoveeDeviceLibrary.hasOwnProperty(controller.sku)){
+		device.log(`SKU (${controller.sku}) not found on the library, using ${UnknownSkuLedCount} LEDs!`);
 		device.setName(`Govee: ${controller.sku}`);
-		SetLedCount(20);
+		// An unrecognised device gets the one protocol every Govee light accepts.
+		autoProtocol = "Static";
+		device.SetIsSubdeviceController(false);
+		SetLedCount(UnknownSkuLedCount);
+
+		return;
+	}
+
+	const GoveeDeviceInfo = GoveeDeviceLibrary[controller.sku];
+	blendByDefault = GoveeDeviceInfo.blendSegments ?? true;
+	device.setName(`Govee ${GoveeDeviceInfo.sku} - ${GoveeDeviceInfo.name}`);
+	autoProtocol = GetAutoProtocol(GoveeDeviceInfo);
+	device.log(`Auto protocol for ${GoveeDeviceInfo.sku} resolved to ${autoProtocol}.`);
+
+	// The library count is a best guess for devices sold in several lengths, so those expose it as
+	// a setting. This is the only way a user can correct a wrong count, which is why it has to be
+	// wired to something -- the flag sat declared and unread while components were the only path.
+	if(GoveeDeviceInfo.hasVariableLedCount){
+		device.addProperty({property: "variableLedCount", group: "settings", label: "Segment Count", description: "How many segments this device has. The library ships a default per SKU, but these are sold in several lengths, so correct it here if the effect does not reach the end of the device.", type: "number", min: 1, max: 60, default: GoveeDeviceInfo.ledCount, step: 1});
+		SetLedCount(variableLedCount);
+	}else{
+		ConfigureDevice(GoveeDeviceInfo);
+		device.removeProperty("variableLedCount");
+	}
+	// Only devices genuinely built from separate physical pieces become subdevice controllers, so
+	// each piece can be placed on the canvas on its own. Everything else is one continuous run and
+	// is rendered from the device layout above, with nothing for the user to configure.
+	if(GoveeDeviceInfo.usesSubDevices){
+		device.SetIsSubdeviceController(true);
+
+		for(const subdevice of GoveeDeviceInfo.subdevices){
+			CreateSubDevice(subdevice);
+		}
+	}else{
+		device.SetIsSubdeviceController(false);
 	}
 }
 
@@ -172,26 +369,63 @@ function ConfigureDevice(GoveeDeviceInfo){
 		ledNames = GoveeDeviceInfo.ledNames || Array.from({length: ledCount}, (_, i) => `Led ${i + 1}`);
 		device.setSize(GoveeDeviceInfo.size);
 	}else{
-		CreateLedMap(ledCount);
+		CreateLedMap();
 		device.setSize([ledCount, 1]);
 	}
 
 	device.setControllableLeds(ledNames, ledPositions);
 }
 
+/** Called by the host when the user changes the Segment Count setting on a device that has one. */
+export function onvariableLedCountChanged(){
+	SetLedCount(variableLedCount);
+}
+
+function GetAutoProtocol(GoveeDeviceInfo){
+	if(GoveeDeviceInfo.supportDreamView){
+		return "Dreamview";
+	}
+
+	if(GoveeDeviceInfo.supportRazer){
+		return "RazerV1";
+	}
+
+	// Everything else only ever responded to plain colorwc commands.
+	return "Static";
+}
+
+/** Whether to let the firmware fade between the colors we send. Auto defers to the library, since
+ * whether blending helps depends on the device being one continuous run of LEDs rather than
+ * several separate pieces. */
+function ShouldBlend(){
+	if(blendSegments === "On"){
+		return true;
+	}
+
+	if(blendSegments === "Off"){
+		return false;
+	}
+
+	return blendByDefault;
+}
+
+/** Gives the device a real LED layout. This is what lets a device light straight after being
+ * linked: the host can map the canvas onto it without the user assigning anything first. */
 function SetLedCount(count){
 	ledCount = count;
 
-	CreateLedMap(count);
-	device.setSize([count, 1]);
+	CreateLedMap();
+	device.setSize([ledCount, 1]);
 	device.setControllableLeds(ledNames, ledPositions);
 }
 
-function CreateLedMap(count){
+/** A single horizontal run. Every DreamView device addresses its segments as one ordered
+ * sequence, so the wire order is the layout order and there is nothing cleverer to do here. */
+function CreateLedMap(){
 	ledNames = [];
 	ledPositions = [];
 
-	for(let i = 0; i < count; i++){
+	for(let i = 0; i < ledCount; i++){
 		ledNames.push(`Led ${i + 1}`);
 		ledPositions.push([i, 0]);
 	}
@@ -207,52 +441,86 @@ function ClearSubdevices(){
 
 function CreateSubDevice(subdevice){
 	const count = device.getCurrentSubdevices().length;
-	device.log(subdevice);
 	subdevice.id = `${subdevice.name} ${count + 1}`;
 	device.createSubdevice(subdevice.id);
 
 	device.setSubdeviceName(subdevice.id, subdevice.name);
-	device.setSubdeviceImage(subdevice.id, "");
+	device.setSubdeviceImage(subdevice.id, controller.deviceImage);
 	device.setSubdeviceSize(subdevice.id, subdevice.size[0], subdevice.size[1]);
 	device.setSubdeviceLeds(subdevice.id, subdevice.ledNames, subdevice.ledPositions);
 
 	subdevices.push(subdevice);
 }
 
-function hexToRgb(hex) {
-	const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-	const colors = [];
-	colors[0] = parseInt(result[1], 16);
-	colors[1] = parseInt(result[2], 16);
-	colors[2] = parseInt(result[3], 16);
-
-	return colors;
-}
-
-function smoothRGB(targetRGB) {
-	if(!prevRGBData) {
-		prevRGBData = targetRGB.slice();
-		return targetRGB;
+/** The single color every LED takes this frame, or undefined to read the canvas per LED.
+ *
+ * Color properties arrive from the host as objects rather than hex strings, so this goes through
+ * createColorArray instead of parsing hex -- the reason the old hexToRgb helper is not restored
+ * along with the rest of this. */
+function FixedFrameColor(overrideColor){
+	if(overrideColor){
+		return device.createColorArray(overrideColor, 1, "Inline");
 	}
 
-	const smoothed = [];
-	for(let i = 0; i < targetRGB.length; i++) {
-		const diff = targetRGB[i] - prevRGBData[i];
-		prevRGBData[i] += diff * smoothFactor;
-		smoothed[i] = Math.round(prevRGBData[i]);
+	if(LightingMode === "Forced"){
+		return device.createColorArray(forcedColor, 1, "Inline");
 	}
-	return smoothed;
+
+	return undefined;
 }
 
+/** Colors for a device rendered as one continuous run, in layout order. */
+function GetDeviceRGB(overrideColor){
+	const RGBData = new Array(ledCount * 3).fill(0);
+	const fixedColor = FixedFrameColor(overrideColor);
+
+	for(let i = 0; i < ledPositions.length; i++){
+		const ledPosition = ledPositions[i];
+		const color = fixedColor ?? device.color(ledPosition[0], ledPosition[1]);
+
+		RGBData[i * 3] = color[0];
+		RGBData[i * 3 + 1] = color[1];
+		RGBData[i * 3 + 2] = color[2];
+	}
+
+	return RGBData;
+}
+
+/** Colors for a device built from separate pieces, in subdevice order, which is the order the
+ * device chains them on the wire.
+ *
+ * The index runs across all subdevices rather than restarting inside each. The version that
+ * shipped before the components rewrite restarted it, so with two identically shaped pieces --
+ * which is every such entry in the library -- the second overwrote the first and only half the
+ * device's colors were ever sent. */
+function GetRGBFromSubdevices(overrideColor){
+	const RGBData = [];
+	const fixedColor = FixedFrameColor(overrideColor);
+	let index = 0;
+
+	for(const subdevice of subdevices){
+		for(const ledPosition of subdevice.ledPositions){
+			const color = fixedColor ?? device.subdeviceColor(subdevice.id, ledPosition[0], ledPosition[1]);
+
+			RGBData[index * 3] = color[0];
+			RGBData[index * 3 + 1] = color[1];
+			RGBData[index * 3 + 2] = color[2];
+			index++;
+		}
+	}
+
+	return RGBData;
+}
+
+// -------------------------------------------<( Discovery Service )>--------------------------------------------------
 let UDPServer;
 
 export function DiscoveryService() {
-	this.IconUrl = "https://assets.signalrgb.com/brands/products/govee_ble/icon@2x.png";
+	this.IconUrl = "https://assets.signalrgb.com/brands/govee/logo.png";
 	this.firstRun = true;
 
 	this.Initialize = function(){
 		service.log("Searching for Govee network devices...");
-		this.LoadCachedDevices();
 	};
 
 	this.UdpBroadcastPort = 4001;
@@ -271,7 +539,14 @@ export function DiscoveryService() {
 
 		for(const [key, value] of this.cache.Entries()){
 			service.log(`Found Cached Device: [${key}: ${JSON.stringify(value)}]`);
+			
+			this.CreateControllerDevice(value);
 			this.checkCachedDevice(value.ip);
+
+			// Nothing to link. A cached device is one the user has already accepted, so it is adopted
+			// unless they explicitly ignored it, and announcing it is announce()'s job on the Update
+			// tick that follows this loop. This used to call link() here, which announced a second
+			// time and so listed every accepted device twice.
 		}
 	};
 
@@ -295,31 +570,16 @@ export function DiscoveryService() {
 
 	this.clearSockets = function() {
 		if(Date.now() - this.activeSocketTimer > 10000 && this.activeSockets.size > 0) {
-			service.log("Nuking Active Cache Sockets.");
+			service.log("Clearing inactive devices Sockets. All cached devices should have responded by now if they were online.");
 
 			for(const [key, value] of this.activeSockets.entries()){
-				service.log(`Nuking Socket for IP: [${key}]`);
+				service.log(`Clearing Socket for IP: [${key}]`);
 				value.stop();
 				this.activeSockets.delete(key);
 				//Clear would be more efficient here, however it doesn't kill the socket instantly.
 				//We instead would be at the mercy of the GC.
 			}
 		}
-	};
-
-	this.forceDiscovery = function(value) {
-		const packetType = JSON.parse(value.response).msg.cmd;
-		service.log(`Type: ${packetType}`);
-
-		if(packetType === "scan"){
-			service.log(`New host discovered!`);
-			service.log(value);
-			this.CreateControllerDevice(value);
-		}
-	};
-
-	this.purgeIPCache = function() {
-		this.cache.PurgeCache();
 	};
 
 	this.CheckForDevices = function(){
@@ -339,7 +599,47 @@ export function DiscoveryService() {
 		}));
 	};
 
+	this.Discovered = function(value) {
+		const response	= JSON.parse(value.response);
+
+		// Check if the response packet has the "scan" response from Govee
+		if(response.msg.cmd != "scan"){
+			return;
+		}
+
+		// Check if the response packet has the ip field in the response from Govee
+		const isValid = response.msg.data.hasOwnProperty("ip");
+
+		if(!isValid){
+			service.log(`Potential Govee device ${response.msg.data.sku} found at ${value.ip} discarded since it's missing an IP field. If this is a Matter device, is not supported yet.`);
+			service.log(response.msg.data)
+			return;
+		}
+
+		// Only log the find once, but always fall through to CreateControllerDevice so a
+		// cached device whose controller went missing is rebuilt on the next scan.
+		if(!this.cache.Has(value.id)){
+			service.log(`Govee device ${response.msg.data.sku} discovered at ${value.ip}!`);
+		}
+
+		this.CreateControllerDevice(value);
+	};
+
+	this.forceDiscovery = function(value) {
+		this.Discovered(value);
+	};
+
+	this.purgeIPCache = function() {
+		this.cache.PurgeCache();
+	};
+
 	this.Update = function(){
+
+		if(this.firstRun){
+			this.LoadCachedDevices();
+			this.firstRun = false;
+		}
+
 		for(const cont of service.controllers){
 			cont.obj.update();
 		}
@@ -348,45 +648,190 @@ export function DiscoveryService() {
 		this.CheckForDevices();
 	};
 
+	this.getSocket = function(key) {
+		return this.activeSockets.get(key);
+	};
+
 	this.Shutdown = function(){
 
 	};
 
-	this.Discovered = function(value) {
+	this.remove = function(controllerObj = false){
 
-		const packetType = JSON.parse(value.response).msg.cmd;
-		service.log(`Type: ${packetType}`);
+		if (controllerObj) {
+			service.log(`Stopping UDP Socket for ${controllerObj.ip}`);
+			const udpSocket = this.getSocket(controllerObj.ip);
+			if(udpSocket){
+				udpSocket.stop();
+				this.activeSockets.delete(controllerObj.ip);
+			}
 
-		if(packetType === "scan"){
-			service.log(`New host discovered!`);
-			service.log(value);
-			this.CreateControllerDevice(value);
+			service.log(`Removing from cache: ${controllerObj.id}`);
+			this.cache.Remove(controllerObj.id)
+			
+			service.log(`Removing controller: ${controllerObj.id}`);
+			service.suppressController(controllerObj);
+			service.removeController(controllerObj);
+		} else {
+			this.cache.PurgeCache();
+			const cachedDevices = this.cache.Entries()
+			console.log(cachedDevices);
+	
+			for(const [key, value] of cachedDevices){
+				service.log(`Removing Cached Device: [${key}: ${JSON.stringify(value)}]`);
+				service.suppressController(value);
+				service.removeController(value);
+			}
+
+			this.cache.DumpCache();
 		}
-	};
-
-	this.Removal = function(value){
 
 	};
 
 	this.CreateControllerDevice = function(value){
+		// Cache entries are keyed by their own id, so going through the cache to find the
+		// controller id is a round trip to the same value. Ask the service directly.
 		const controller = service.getController(value.id);
 
-		if (controller === undefined) {
+		if(controller === undefined){
+			service.log(`No controller found for ${value.id}, creating one!`);
 			service.addController(new GoveeController(value));
-		} else {
+		}else{
 			controller.updateWithValue(value);
 		}
 	};
+
+	/** Undoes an ignore. There is no such thing as linking a Govee light: the LAN API is
+	 * unauthenticated UDP on port 4003 and nothing is ever negotiated with the device, so the only
+	 * state a user can meaningfully set is whether we leave it alone. This was called link(), and
+	 * the button for it said "Link", which described a handshake that does not exist. */
+	this.restore = function(controllerObj){
+		service.log(`Restoring controller: ${controllerObj.id}`);
+
+		const controller = service.getController(controllerObj.id);
+
+		if(controller === undefined){
+			service.log(`Cannot restore ${controllerObj.id}, no controller exists for it.`);
+
+			return;
+		}
+
+		controller.ignored = false;
+
+		// Update controller
+		controller.updateWithValue(controller);
+
+		// Announced directly rather than through announce(), which has already run for this
+		// controller and would correctly refuse to run again. This is the user asking by name.
+		service.announceController(controller);
+
+		// Update cache
+		this.cacheControllerInfo(controller);
+
+		service.log(`Restored controller: ${controller.id}`);
+	}
+
+	/** Tells us to leave a device alone. The only real state in here -- see restore(). */
+	this.ignore = function(controllerObj) {
+		service.log(`Ignoring controller: ${JSON.stringify(controllerObj)}`);
+
+		const controller = service.getController(controllerObj.id);
+
+		if(controller === undefined){
+			service.log(`Cannot ignore ${controllerObj.id}, no controller exists for it.`);
+
+			return;
+		}
+
+		// Sockets are keyed by IP, not by controller id.
+		service.log(`Stopping UDP Socket for ${controllerObj.ip}`);
+		const udpSocket = this.getSocket(controllerObj.ip);
+		if(udpSocket){
+			udpSocket.stop();
+			this.activeSockets.delete(controllerObj.ip);
+		}
+
+		controller.ignored = true;
+
+		controller.updateWithValue(controller);
+		service.suppressController(controller);
+
+		// Update cache
+		this.cacheControllerInfo(controller);
+	}
+
+	this.cacheControllerInfo = function(value) {
+		discovery.cache.Add(
+			value.id, {
+				id: value.id,
+				ignored: value.ignored,
+				ip: value.ip,
+				name: value.sku,
+				GoveeInfo: value.GoveeInfo,
+				supportDreamView: value.GoveeInfo.supportDreamView,
+				supportRazer: value.GoveeInfo.supportRazer,
+				deviceImage: value.GoveeInfo.deviceImage,
+				device: value.device,
+				sku: value.sku,
+				bleVersionHard: value.bleVersionHard,
+				bleVersionSoft: value.bleVersionSoft,
+				wifiVersionHard: value.wifiVersionHard,
+				wifiVersionSoft: value.wifiVersionSoft,
+				initialized: value.initialized
+			}
+		);
+	}
+}
+
+/** Reads a controller's ignore flag, converting entries written before it was called that.
+ *
+ * The flag used to be stored as "paired", the inverse of this one, and it never meant pairing --
+ * ignoring a device wrote false and nothing ever wrote true except a Link button for a handshake
+ * that does not exist. Old entries are converted rather than dropped, or every device anyone had
+ * ignored reappears the first time they run this build.
+ *
+ * Absent everywhere means not ignored, which is the right default: a device the user has not spoken
+ * about is one we adopt. */
+function ResolveIgnored(value, id){
+	const cached = discovery.cache.Get(id);
+
+	if(value?.ignored !== undefined){
+		return value.ignored;
+	}
+
+	if(cached?.ignored !== undefined){
+		return cached.ignored;
+	}
+
+	if(value?.paired !== undefined){
+		return value.paired === false;
+	}
+
+	if(cached?.paired !== undefined){
+		return cached.paired === false;
+	}
+
+	return false;
 }
 
 class GoveeController{
 	 constructor(value){
 		this.id = value?.id ?? "Unknown ID";
+		// Discovery responses carry no ignore state, and this constructor persists straight to the
+		// cache below. Without the cache fallback a scan reply that arrives before the cached devices
+		// load rebuilds the controller as not-ignored and writes that over the stored flag, so a
+		// device the user had ignored comes back on startup.
+		this.ignored = ResolveIgnored(value, this.id);
 
-		const packet = JSON.parse(value.response).msg;
-		const response = packet.data;
-		const type = packet.cmd;
-		service.log(`Type: ${type}`);
+		let response;
+
+		// Handle discovery or cached device
+		if (value.response) {
+			const packet = JSON.parse(value.response).msg;
+			response = packet.data;
+		} else {
+			response = value
+		}
 
 		service.log(response);
 
@@ -409,7 +854,7 @@ class GoveeController{
 
 		this.DumpControllerInfo();
 
-		if(this.name !== "Unknown") {
+		if(this.name !== "Unknown SKU") {
 			this.cacheControllerInfo(this);
 		}
 	}
@@ -442,8 +887,23 @@ class GoveeController{
 
 	updateWithValue(value){
 		this.id = value.id;
+		// Discovery responses carry no ignore state, so only take it when it is actually present.
+		// Assigning it blindly un-ignored the device on every scan reply. Older cache entries carry
+		// the inverse under "paired", so accept that too rather than silently keeping the default.
+		if(value?.ignored !== undefined){
+			this.ignored = value.ignored;
+		}else if(value?.paired !== undefined){
+			this.ignored = value.paired === false;
+		}
 
-		const response = JSON.parse(value.response).msg.data;
+		let response;
+
+		// Handle discovery or cached device
+		if (value.response) {
+			response = JSON.parse(value.response).msg.data;
+		} else {
+			response = value
+		}
 
 		this.ip = response?.ip ?? "Unknown IP";
 		this.device = response.device;
@@ -456,23 +916,56 @@ class GoveeController{
 		service.updateController(this);
 	}
 
-	update(){
-		if(!this.initialized){
-			this.initialized = true;
-			service.updateController(this);
-			service.announceController(this);
+	/** Promotes this controller to a device, once and only once.
+	 *
+	 * Both the discovery Update tick and the old link path wanted to do this, and announcing twice
+	 * puts the device in SignalRGB's list twice -- which is why an accepted device showed up as two
+	 * identical tiles while an ignored one showed up as one. The guard belongs on the controller
+	 * rather than at either call site, because neither can know what the other already did. */
+	announce(){
+		if(this.initialized){
+			return;
 		}
+
+		this.initialized = true;
+		service.updateController(this);
+
+		// An ignored device keeps its controller, so it can be restored from the interface, but is
+		// never promoted to a device. Announcing it regardless is why ignoring one did not survive a
+		// restart: the controller was rebuilt un-suppressed and nothing put it back.
+		if(this.ignored){
+			return;
+		}
+
+		service.announceController(this);
+	}
+
+	update(){
+		this.announce();
 	}
 
 	cacheControllerInfo(value){
-		discovery.cache.Add(value.id, {
-			name: value.name,
-			ip: value.ip,
-			id: value.id
-		});
+		discovery.cache.Add(
+			value.id, {
+				id: value.id,
+				ignored: value.ignored,
+				ip: value.ip,
+				name: value.sku,
+				GoveeInfo: value.GoveeInfo,
+				supportDreamView: value.GoveeInfo.supportDreamView,
+				supportRazer: value.GoveeInfo.supportRazer,
+				deviceImage: value.GoveeInfo.deviceImage,
+				device: value.device,
+				sku: value.sku,
+				bleVersionHard: value.bleVersionHard,
+				bleVersionSoft: value.bleVersionSoft,
+				wifiVersionHard: value.wifiVersionHard,
+				wifiVersionSoft: value.wifiVersionSoft,
+				initialized: value.initialized
+			}
+		);
 	}
 }
-
 
 class GoveeProtocol {
 
@@ -506,7 +999,19 @@ class GoveeProtocol {
 		}));
 	}
 
-	SetRazerMode(enable){
+	/** Hands control of the device to the network, or gives it back. Nothing to do with the
+	 * Razer protocol despite the JSON envelope -- "razer" is simply how the LAN API carries
+	 * any encoded packet, colour frames included. The payloads decode to
+	 * BB 00 01 B1 01 0A and BB 00 01 B1 00 0B: command 0xB1, enable and disable. Colour
+	 * frames (0xB0) are ignored unless this has been enabled.
+	 *
+	 * NOT FREE TO SEND. Enabling drops a frame on the device as it re-enters stream mode -- and the
+	 * dropped frame cannot be refilled, since the colour frame Render sends immediately afterwards in
+	 * the same tick is itself discarded. One is unnoticeable at startup; on a repeat it reads as a
+	 * black flash, which shipped twice, at every 150 frames and then every 40 seconds. Send it when
+	 * control is actually being taken, never on a timer, and never as a cheap "just in case".
+	 * MaintainStreamingMode is the only thing that should ever call this outside of setup. */
+	SetStreamingMode(enable){
 		UDPServer.send(JSON.stringify({msg:{cmd:"razer", data:{pt:enable?"uwABsQEK":"uwABsQAL"}}}));
 	}
 
@@ -520,17 +1025,29 @@ class GoveeProtocol {
 		return checksum;
 	}
 
-	createDreamViewPacket(colors) {
+	// Byte 4, before the colour count, changes how the device treats the colours. We sent 0x01 for
+	// years without knowing what it meant. Measured on an H70BC curtain: at 0x00 a colour fills its
+	// segment cleanly, at 0x01 it bleeds into the neighbouring segment. Anything above 1 behaves
+	// like 1, which rules out a bit flag.
+	//
+	// 0x00 is the right default. SignalRGB hands us one colour per addressable segment and expects
+	// them applied as given, and on a curtain the bleed crosses a physical gap between strands that
+	// does not exist in the light. Whatever the field is really called, we want the version that
+	// does not smear our pixels.
+	createDreamViewPacket(colors, mode = 0x00) {
 		// Define the Dreamview protocol header
-		const header = [0xBB, 0x00, 0x20, 0xB0, 0x01, colors.length / 3];
-		const fullPacket = header.concat(colors);
+
+		const packetToCheck = [mode & 0xff, colors.length / 3].concat(colors);
+
+		const header = [0xBB, (packetToCheck.length >> 8 & 0xff), (packetToCheck.length & 0xff), 0xB0];
+		const fullPacket = header.concat(packetToCheck);
 		const checksum = this.calculateXorChecksum(fullPacket);
 		fullPacket.push(checksum);
 
 		return fullPacket;
 	}
 
-	createRazerPacket(colors) {
+	createRazerPacketV1(colors) {
 		// Define the Razer protocol header
 		const header = [0xBB, 0x00, 0x0E, 0xB0, 0x01, colors.length / 3];
 		const fullPacket = header.concat(colors);
@@ -539,7 +1056,16 @@ class GoveeProtocol {
 		return fullPacket;
 	}
 
-	SetStaticColor(RGBData){
+	createRazerPacketV2(colors) {
+		// Define the Razer protocol header
+		const header = [0xBB, 0x00, 0x0E, 0xB0, 0x01, colors.length];
+		const fullPacket = header.concat(colors);
+		fullPacket.push(this.calculateXorChecksum(fullPacket)); // Checksum
+
+		return fullPacket;
+	}
+
+	SendStaticColor(RGBData){
 		UDPServer.send(JSON.stringify({
 			msg: {
 				cmd: "colorwc",
@@ -549,15 +1075,35 @@ class GoveeProtocol {
 				}
 			}
 		}));
+	}
+
+	SetStaticColor(RGBData){
+		this.SendStaticColor(RGBData);
+
+		// colorwc changes device state rather than streaming a frame, so the render loop has
+		// to throttle itself or it floods the device. Only wanted on the render path.
 		device.pause(100);
 	}
 
 	SendEncodedPacket(packet){
 		const command = base64.Encode(packet);
 
+		if(!loggedFirstFrame){
+			loggedFirstFrame = true;
+			const layout = subdevices.length > 0 ? `${subdevices.length} subdevice(s)` : `${ledCount} LED(s)`;
+			device.log(`Streaming started: ${packet.length} byte frame over ${layout}.`);
+		}
+
+		// Debug
+		//device.log(`[${protocolSelect}] segments=${(packet.length - 7)/3 | 0} raw packet bytes=${packet.length}`);
+
 		const now = Date.now();
 
-		if (now - this.lastPacket > 1000) {
+		// Switchable because it is the main suspect for knocking the device out of stream mode: it is
+		// a non-razer command arriving in the middle of the frame stream, once a second, and Shutdown
+		// already has to leave stream mode before colorwc will stick. Its replies are also the only
+		// liveness signal we have, so the two cannot be judged separately -- hence the setting.
+		if (statusQuery && now - this.lastPacket > 1000) {
 			UDPServer.send(JSON.stringify({
 				msg: {
 					cmd: "status",
@@ -577,29 +1123,35 @@ class GoveeProtocol {
 		}));
 	}
 
-	SendRGB(RGBData) {
+	SendRGB(overrideColor) {
+		let packet  = [];
+		// Subdevice devices are several physical pieces placed separately on the canvas, so their
+		// colors are read per piece. Everything else is one run read straight from the layout.
+		const RGBData = subdevices.length > 0 ? GetRGBFromSubdevices(overrideColor) : GetDeviceRGB(overrideColor);
 
-		if (this.supportDreamView) {
-			const packet = this.createDreamViewPacket(RGBData);
-			this.SendEncodedPacket(packet);
-		} else if(this.supportRazer) {
-			const packet = this.createRazerPacket(RGBData);
-			this.SendEncodedPacket(packet);
-		} else{
-			this.SetStaticColor(RGBData.slice(0, 3));
+		switch (protocolSelect === "Auto" ? autoProtocol : protocolSelect) {
+			// One Dreamview frame, with the length computed. The old split into V1/V2 was really
+			// a broken implementation sitting next to a correct one, not two protocol versions.
+			case "Dreamview":
+				packet = this.createDreamViewPacket(RGBData, ShouldBlend() ? 0x01 : 0x00);
+				this.SendEncodedPacket(packet);
+				break;
+			case "RazerV1":
+				packet = this.createRazerPacketV1(RGBData);
+				this.SendEncodedPacket(packet);
+				break;
+			case "RazerV2":
+				packet = this.createRazerPacketV2(RGBData);
+				this.SendEncodedPacket(packet);
+				break;
+			case "Static":
+				this.SetStaticColor(RGBData.slice(0, 3));
+				break;
+		
+			default:
+				this.SetStaticColor(RGBData.slice(0, 3));
+				break;
 		}
-	}
-}
-
-function safeLog(message, opt) {
-	if (typeof service !== "undefined" && typeof service.log === "function") {
-		if (opt !== undefined) {
-			service.log(message, opt);
-		} else {
-			service.log(message);
-		}
-	} else if (typeof device !== "undefined" && typeof device.log === "function") {
-		device.log(message);
 	}
 }
 
@@ -612,6 +1164,15 @@ class UdpSocketServer{
 		this.broadcastPort = args?.broadcastPort ?? 4001;
 		this.ipToConnectTo = args?.ip ?? "239.255.255.250";
 		this.isDiscoveryServer = args?.isDiscoveryServer ?? false;
+		this.connected = false;
+
+		this.log = (msg) => { this.isDiscoveryServer ? service.log(msg) : device.log(msg); };
+
+		this.responseCallbackFunction = (msg) => { this.log("No Response Callback Set Callback cannot function"); msg; };
+	}
+
+	setCallbackFunction(responseCallbackFunction) {
+		this.responseCallbackFunction = responseCallbackFunction;
 	}
 
 	write(packet, address, port) {
@@ -625,7 +1186,7 @@ class UdpSocketServer{
 	send(packet) {
 		if(!this.server) {
 			this.server = udp.createSocket();
-			safeLog("Defining new UDP Socket so we can send data.");
+			this.log("Defining new UDP Socket so we can send data.");
 		}
 
 		this.server.send(packet);
@@ -635,7 +1196,6 @@ class UdpSocketServer{
 		this.server = udp.createSocket();
 
 		if(this.server){
-
 			// Given we're passing class methods to the server, we need to bind the context (this instance) to the function pointer
 			this.server.on('error', this.onError.bind(this));
 			this.server.on('message', this.onMessage.bind(this));
@@ -643,11 +1203,12 @@ class UdpSocketServer{
 			this.server.on('connection', this.onConnection.bind(this));
 			this.server.bind(this.listenPort);
 			this.server.connect(this.ipToConnectTo, this.broadcastPort);
-
 		}
 	};
 
 	stop(){
+		this.connected = false;
+
 		if(this.server) {
 			this.server.disconnect();
 			this.server.close();
@@ -655,48 +1216,59 @@ class UdpSocketServer{
 	}
 
 	onConnection(){
-		safeLog('Connected to remote socket!');
-		safeLog("Remote Address:");
-		safeLog(this.server.remoteAddress(), {pretty: true});
-		safeLog("Sending Check to socket");
+		this.connected = true;
+		this.log('Connected to remote socket!');
+		this.log("Socket information:");
+		this.log(this.server.remoteAddress(), {pretty: true});
 
-		const bytesWritten = this.server.send(JSON.stringify({
-			msg: {
-				cmd: "scan",
-				data: {
-					account_topic: "reserve",
-				},
+		if(this.isDiscoveryServer) {
+			this.log("Sending Check to socket and waiting for device to respond...");
+
+			const bytesWritten = this.server.send(JSON.stringify({
+				msg: {
+					cmd: "scan",
+					data: {
+						account_topic: "reserve",
+					},
+				}
+			}));
+
+			if(bytesWritten === -1){
+				this.log('Error sending data to remote socket');
 			}
-		}));
-
-		if(bytesWritten === -1){
-			safeLog('Error sending data to remote socket');
 		}
 	};
 
 	onListenerResponse(msg) {
-		safeLog('Data received from client');
-		safeLog(msg, {pretty: true});
+		this.log('Data received from client');
+		this.log(msg, {pretty: true});
 	}
 
 	onListening(){
 		const address = this.server.address();
-		safeLog(`Server is listening at port ${address.port}`);
+		this.log(`Server is listening at port ${address.port}`);
 
 		// Check if the socket is bound (no error means it's bound but we'll check anyway)
-		safeLog(`Socket Bound: ${this.server.state === this.server.BoundState}`);
+		this.log(`Socket Bound: ${this.server.state === this.server.BoundState}`);
 	};
 	onMessage(msg){
-		safeLog('Data received from client');
-		safeLog(msg, {pretty: true});
-
-		if(this.isDiscoveryServer && typeof discovery !== "undefined" && typeof discovery.forceDiscovery === "function") {
+		if(this.isDiscoveryServer) {
+			this.log('Data received from client');
+			this.log(msg, {pretty: true});
 			discovery.forceDiscovery(msg);
+			this.server.close();
+
+			return;
 		}
+
+		// A device socket's replies used to be logged and dropped on the floor. They arrive about
+		// once a second, so they are handed to the callback rather than logged -- the handler decides
+		// what is worth saying.
+		this.responseCallbackFunction(msg);
 	};
 	onError(code, message){
-		safeLog(`Error: ${code} - ${message}`);
-		//this.server.close(); // We're done here
+		this.log(`Error: ${code} - ${message}`);
+		this.server.close(); // We're done here
 	};
 }
 
@@ -709,12 +1281,10 @@ class IPCache{
 		this.PopulateCacheFromStorage();
 	}
 	Add(key, value){
-		if(!this.cacheMap.has(key)) {
-			service.log(`Adding ${key} to IP Cache...`);
+		service.log(`Adding ${key} to IP Cache...`);
 
-			this.cacheMap.set(key, value);
-			this.Persist();
-		}
+		this.cacheMap.set(key, value);
+		this.Persist();
 	}
 
 	Remove(key){
@@ -780,24 +1350,29 @@ class IPCache{
 	}
 }
 
-
-
 // eslint-disable-next-line max-len
-/** @typedef { {name: string, deviceImage: string, sku: string, state: number, supportRazer: boolean, supportDreamView: boolean, ledCount: number, hasVariableLedCount?: boolean } } GoveeDevice */
+/** @typedef { {name: string, ledCount: number, size: number[], ledNames: string[], ledPositions: number[][] } } GoveeSubdevice */
+/** blendSegments: whether the device should fade between the colors we send rather than applying
+ * each to its own segment. Absent means blend, matching what shipped before the byte was
+ * understood. Set false on anything built from separate physical pieces -- on a curtain the fade
+ * crosses the gap between two hanging strands, a seam that exists in the data order and not in
+ * the light. */
+// eslint-disable-next-line max-len
+/** @typedef { {name: string, deviceImage: string, sku: string, state: number, supportRazer: boolean, supportDreamView: boolean, ledCount: number, hasVariableLedCount?: boolean, usesSubDevices?: boolean, subdevices?: GoveeSubdevice[], blendSegments?: boolean } } GoveeDevice */
 /** @type {Object.<string, GoveeDevice>} */
 const GoveeDeviceLibrary = {
 	H6061: {
 		name: "Glide Hexa Light Panels",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/c5dbf326ba8af931cb8e0b65dd38b363-pic_h6061.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6061.png",
 		sku: "H6061",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 15
+		ledCount: 30
 	},
 	H6062: {
 		name: "Glide Wall Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/87cb406c046fb458c6d1a7079fc0023c-pic_h6062.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6062.png",
 		sku: "H6062",
 		state: 1,
 		supportRazer: true,
@@ -807,7 +1382,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6065: {
 		name: "Glide Y Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/16fcb620704c3e23683e782a149be4d4-pic_h6065.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6065.png",
 		sku: "H6065",
 		state: 1,
 		supportRazer: true,
@@ -816,7 +1391,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6066: {
 		name: "Glide Hexa Pro Light Panels",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/96747e10e46f7b2788cb1e708adb1d4c-pic_h6066.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6066.png",
 		sku: "H6066",
 		state: 1,
 		supportRazer: true,
@@ -825,7 +1400,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6067: {
 		name: "Glide Tri Light Panels",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/6e575f82591ee04902f5f92a4f0d2301-pic_h6067.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6067.png",
 		sku: "H6067",
 		state: 1,
 		supportRazer: true,
@@ -834,28 +1409,28 @@ const GoveeDeviceLibrary = {
 	},
 	H6609: {
 		name: "Gaming Light Strip G1",
-		deviceImage: "",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6609.png",
 		sku: "H6609",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
 		ledCount: 10,
-		size: [4,3],
-		ledNames: [ "Led 1", "Led 2", "Led 3", "Led 4", "Led 5", "Led 6", "Led 7", "Led 8", "Led 9", "Led 10" ],
+		size: [4, 3],
+		ledNames: ["Led 1", "Led 2", "Led 3", "Led 4", "Led 5", "Led 6", "Led 7", "Led 8", "Led 9", "Led 10"],
 		ledPositions: [[0, 2], [0, 1], [0, 0], [1, 0], [2, 0], [3, 0], [3, 1], [3, 2], [2, 2], [1, 2]]
 	},
 	H610A: {
 		name: "Glide Lively Wall Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/de6825d1888767fba52136e98c5c1d84-pic_h610a.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h610a.png",
 		sku: "H610A",
 		state: 1,
 		supportRazer: false,
-		supportDreamView: false,
-		ledCount: 1
+		supportDreamView: true,
+		ledCount: 24
 	},
 	H610B: {
 		name: "Glide Music Wall Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/2e2d4ef6693f74f7704d3f5e6b42a554-pic_h610b.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h610b.png",
 		sku: "H610B",
 		state: 1,
 		supportRazer: false,
@@ -864,7 +1439,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6087: {
 		name: "RGBIC Fixture Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/6b9765e90b3dbb1efd7d18855b90357a-pic_h6087.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6087.png",
 		sku: "H6087",
 		state: 1,
 		supportRazer: false,
@@ -873,7 +1448,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6056: {
 		name: "Flow Plus Light Bar",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/d7606004574f941d8775e6f56b127739-pic_h6056.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6056.png",
 		sku: "H6056",
 		state: 1,
 		supportRazer: true,
@@ -899,7 +1474,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6046: {
 		name: "RGBIC TV Light Bars",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/456da607c09aec3228f9cf8ae36d72d2-pic_h6046.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6046.png",
 		sku: "H6046",
 		state: 1,
 		supportRazer: true,
@@ -925,16 +1500,42 @@ const GoveeDeviceLibrary = {
 	},
 	H6047: {
 		name: "RGBIC Gaming Light Bars",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/21891e5a8b691faf341051b27f3aa237-pic_h6047.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6047.png",
 		sku: "H6047",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
 		ledCount: 15
 	},
+	H6048: {
+		name: "RGBIC TV Light Bars Pro",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6048.png",
+		sku: "H6048",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 0,
+		usesSubDevices: true,
+		subdevices: [
+			{
+				name: "RGBIC TV Light Bars Pro",
+				ledCount: 10,
+				size: [1, 10],
+				ledNames: ["Led 1", "Led 2", "Led 3", "Led 4", "Led 5", "Led 6", "Led 7", "Led 8", "Led 9", "Led 10"],
+				ledPositions: [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [0, 8], [0, 9]],
+			},
+			{
+				name: "RGBIC TV Light Bars Pro",
+				ledCount: 10,
+				size: [1, 10],
+				ledNames: ["Led 1", "Led 2", "Led 3", "Led 4", "Led 5", "Led 6", "Led 7", "Led 8", "Led 9", "Led 10"],
+				ledPositions: [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [0, 8], [0, 9]],
+			},
+		]
+	},
 	H6051: {
 		name: "Table Lamp Lite",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/f015e6f54a8866e0da126715ed459fbd-pic_h6051.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6052.png",
 		sku: "H6051",
 		state: 1,
 		supportRazer: false,
@@ -943,7 +1544,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6059: {
 		name: "RGB Night Light Mini",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/4f75d0c656a579ed7ed1a2c149d07425-pic_h6059.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6059.png",
 		sku: "H6059",
 		state: 1,
 		supportRazer: false,
@@ -952,7 +1553,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6052: {
 		name: "RGBICWW Table Lamp",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/968a1a8fba6d5badef8bcf165e51eeb2-pic_h6052.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6052.png",
 		sku: "H6052",
 		state: 1,
 		supportRazer: false,
@@ -961,7 +1562,7 @@ const GoveeDeviceLibrary = {
 	},
 	H61A0: {
 		name: "3m RGBIC Neon Rope Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/bcae6126eebd16ec544af1667569be90-pic_h61a0.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61a0.png",
 		sku: "H61A0",
 		state: 1,
 		supportRazer: true,
@@ -970,7 +1571,7 @@ const GoveeDeviceLibrary = {
 	},
 	H61A1: {
 		name: "2m RGBIC Neon Rope Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/4677148fa9b2569a2bc199a999e079fc-pic_h61a1.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61a0.png",
 		sku: "H61A1",
 		state: 1,
 		supportRazer: true,
@@ -979,16 +1580,16 @@ const GoveeDeviceLibrary = {
 	},
 	H61A2: {
 		name: "5m RGBIC Neon Rope Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/62dc52e39efdf5d2f95af407bf9f2a21-pic_h61a2.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61a0.png",
 		sku: "H61A2",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 15
+		ledCount: 70
 	},
 	H61A3: {
 		name: "4m RGBIC Neon Rope Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/ae28b6535367606f7e94947f1d9e6b8e-pic_h61a3.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61a0.png",
 		sku: "H61A3",
 		state: 1,
 		supportRazer: true,
@@ -997,16 +1598,16 @@ const GoveeDeviceLibrary = {
 	},
 	H619A: {
 		name: "5m RGBIC Pro Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/00d6e3f43eb6e1df50ccbfa84054d7db-pic_h619a.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h619a.png",
 		sku: "H619A",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 15
+		ledCount: 20
 	},
 	H619B: {
 		name: "7.5m RGBIC Pro Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/52131582bfb2417cf8ac7c06635f695d-pic_h619b.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h619a.png",
 		sku: "H619B",
 		state: 1,
 		supportRazer: true,
@@ -1015,7 +1616,7 @@ const GoveeDeviceLibrary = {
 	},
 	H619C: {
 		name: "10m RGBIC Pro Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/f9154fdcba85da2c930f899cb3ea037e-pic_h619c.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h619a.png",
 		sku: "H619C",
 		state: 1,
 		supportRazer: true,
@@ -1024,7 +1625,7 @@ const GoveeDeviceLibrary = {
 	},
 	H619D: {
 		name: "2*7.5m RGBIC Pro Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/3bb6c520b09205815743a1564998c041-pic_h619d.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h619a.png",
 		sku: "H619D",
 		state: 1,
 		supportRazer: true,
@@ -1033,16 +1634,16 @@ const GoveeDeviceLibrary = {
 	},
 	H619E: {
 		name: "2*10m RGBIC Pro Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/1957e01b6147810efbf23a5eb08e7791-pic_h619e.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h619a.png",
 		sku: "H619E",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 15
+		ledCount: 30
 	},
 	H619Z: {
 		name: "3m RGBIC Pro Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/6ea5b46c846e1d958dc50141019077d7-pic_h619z.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h619a.png",
 		sku: "H619Z",
 		state: 1,
 		supportRazer: true,
@@ -1051,16 +1652,25 @@ const GoveeDeviceLibrary = {
 	},
 	H61B2: {
 		name: "3m RGBIC Neon TV Backlight",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/5a224ccd2cc850d8b554df2ff0e5a129-pic_h61b2.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61b2.png",
 		sku: "H61B2",
 		state: 1,
 		supportRazer: false,
 		supportDreamView: false,
 		ledCount: 1
 	},
+	H61B5: {
+		name: "3m RGBIC Neon TV Backlight",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61b2.png",
+		sku: "H61B5",
+		state: 1,
+		supportRazer: false,
+		supportDreamView: false,
+		ledCount: 15
+	},
 	H61C2: {
 		name: "RGBIC LED Neon Rope Lights for Desks",
-		deviceImage: "",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61c2.png",
 		sku: "H61C2",
 		state: 1,
 		supportRazer: true,
@@ -1069,16 +1679,25 @@ const GoveeDeviceLibrary = {
 	},
 	H61C3: {
 		name: "RGBIC LED Neon Rope Lights for Desks",
-		deviceImage: "",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61c2.png",
 		sku: "H61C3",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 16
+		ledCount: 42
+	},
+	H61C5: {
+		name: "RGBIC LED Neon Rope Lights for Desks",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61c2.png",
+		sku: "H61C5",
+		state: 1,
+		supportDreamView: true,
+		supportRazer: true,
+		ledCount: 15
 	},
 	H61E0: {
 		name: "LED Strip Light M1",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/5b311c4dd19e17c6eeaf5e662e66904d-pic_h61e1.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61e0.png",
 		sku: "H61E0",
 		state: 1,
 		supportRazer: true,
@@ -1087,7 +1706,7 @@ const GoveeDeviceLibrary = {
 	},
 	H61E1: {
 		name: "LED Strip Light M1",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/5b311c4dd19e17c6eeaf5e662e66904d-pic_h61e1.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61e0.png",
 		sku: "H61E1",
 		state: 1,
 		supportRazer: true,
@@ -1096,7 +1715,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6172: {
 		name: "10m Outdoor RGBIC Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/51e20e4b042edb3a4cb74224b5d23ee7-pic_h6172.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6172.png",
 		sku: "H6172",
 		state: 1,
 		supportRazer: false,
@@ -1105,7 +1724,7 @@ const GoveeDeviceLibrary = {
 	},
 	H615A: {
 		name: "5m RGB Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/c98cbaaa69b377ee063034857807f3be-pic_h615a.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h615a.png",
 		sku: "H615A",
 		state: 1,
 		supportRazer: false,
@@ -1114,7 +1733,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6110: {
 		name: "2*5m MultiColor Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/269cb9958cd5543e405b76f04b75b706-pic_h6110.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6110.png",
 		sku: "H6110",
 		state: 1,
 		supportRazer: false,
@@ -1123,7 +1742,7 @@ const GoveeDeviceLibrary = {
 	},
 	H618A: {
 		name: "5m RGBIC Basic Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/1d2461103cb2eafec6a93b8d8e702d22-pic_h618a.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h618a.png",
 		sku: "H618A",
 		state: 1,
 		supportRazer: false,
@@ -1142,16 +1761,16 @@ const GoveeDeviceLibrary = {
 	},
 	H618C: {
 		name: "10m RGBIC Basic Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/453fc13d798f23c94feda52834f73813-pic_h618c.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h618a.png",
 		sku: "H618C",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 15
+		ledCount: 12
 	},
 	H618E: {
 		name: "2*10m RGBIC Bassic Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/e843bfe60f9c2c161358a050bb50c3c1-pic_h618e.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h618a.png",
 		sku: "H618E",
 		state: 1,
 		supportRazer: false,
@@ -1160,7 +1779,7 @@ const GoveeDeviceLibrary = {
 	},
 	H6117: {
 		name: "2*5m RGBIC Strip Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/c058906f9377b63e5fdd120830148562-pic_h6117.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6117.png",
 		sku: "H6117",
 		state: 1,
 		supportRazer: false,
@@ -1169,7 +1788,7 @@ const GoveeDeviceLibrary = {
 	},
 	H61A5: {
 		name: "10m RGBIC Neon Rope Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/06cff034fc0b736f45812ea294bdbedb-pic_h61a5.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61a0.png",
 		sku: "H61A5",
 		state: 1,
 		supportRazer: true,
@@ -1178,7 +1797,7 @@ const GoveeDeviceLibrary = {
 	},
 	H615B: {
 		name: "10m RGB Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/4d980e98e155f851f35f0d608d3d1587-pic_h615b.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h615a.png",
 		sku: "H615B",
 		state: 1,
 		supportRazer: false,
@@ -1187,8 +1806,17 @@ const GoveeDeviceLibrary = {
 	},
 	H615C: {
 		name: "15m RGB Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/7bf934361a4114103c460d04fe8b67a8-pic_h615c.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h615a.png",
 		sku: "H615C",
+		state: 1,
+		supportRazer: false,
+		supportDreamView: false,
+		ledCount: 1
+	},
+	H615D: {
+		name: "15m RGB Strip Light",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h615a.png",
+		sku: "H615D",
 		state: 1,
 		supportRazer: false,
 		supportDreamView: false,
@@ -1196,7 +1824,7 @@ const GoveeDeviceLibrary = {
 	},
 	H618F: {
 		name: "2*15m RGBIC LED Strip Light",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/ac331687ef8b9fdcd7e77156f9aadb91-pic_h618f.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h618a.png",
 		sku: "H618F",
 		state: 1,
 		supportRazer: false,
@@ -1205,16 +1833,16 @@ const GoveeDeviceLibrary = {
 	},
 	H6072: {
 		name: "RGBICWW Floor Lamp",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/1edf77ca5bb565da3d220db6a2d175c2-pic_h6072.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6072.png",
 		sku: "H6072",
 		state: 1,
 		supportRazer: false,
 		supportDreamView: false,
-		ledCount: 1
+		ledCount: 8
 	},
 	H6073: {
 		name: "Smart RGB Floor Lamp",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/ae9ae475d463236be32ad4818d760e0f-pic_h6073.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6073.png",
 		sku: "H6073",
 		state: 1,
 		supportRazer: false,
@@ -1223,16 +1851,25 @@ const GoveeDeviceLibrary = {
 	},
 	H6076: {
 		name: "RGBICW Floor Lamp Basic",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/241e8ee823f9c2a2057ca3668be7281e-pic_h6076.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6076.png",
 		sku: "H6076",
 		state: 1,
 		supportRazer: false,
-		supportDreamView: false,
-		ledCount: 1
+		supportDreamView: true,
+		ledCount: 68
+	},
+	H6079: {
+		name: "RGBICWW Floor Lamp Pro",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6079.png",
+		sku: "H6079",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 10,
 	},
 	H7060: {
 		name: "4 Pack RGBIC Flood Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/f7817d0f6284c5403324e1268beed798-pic_h7060.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h7060.png",
 		sku: "H7060",
 		state: 1,
 		supportRazer: false,
@@ -1241,7 +1878,7 @@ const GoveeDeviceLibrary = {
 	},
 	H7061: {
 		name: "2 Pack RGBIC Flood Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/aae0bc2498289d61b4ecc0f798e33759-pic_h7061.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h7060.png",
 		sku: "H7061",
 		state: 1,
 		supportRazer: false,
@@ -1250,7 +1887,7 @@ const GoveeDeviceLibrary = {
 	},
 	H7062: {
 		name: "6 Pack RGBIC Flood Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/deals-img/aa27302d9bada483b7e99b3a8a4930a8-pic_h7062.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h7060.png",
 		sku: "H7062",
 		state: 1,
 		supportRazer: false,
@@ -1259,25 +1896,51 @@ const GoveeDeviceLibrary = {
 	},
 	H70B1: {
 		name: "Curtain Lights",
-		deviceImage: "https://d1f2504ijhdyjw.cloudfront.net/posting-img/db7c2bd49b5dc177a4010f773f7e1e32-70b1%E5%8C%85%E8%A3%85.png",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h70b1.png",
 		sku: "H70B1",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
 		ledCount: 10
 	},
+	H70BC: {
+		name: "Netflix Curtain Lights",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h70b1.png",
+		sku: "H70BC",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		// 400 physical LEDs in 20 hanging strands, but DreamView only addresses the strands: one
+		// colour lights one whole strand, and colour index maps to strand 1:1. Verified on
+		// hardware. Sending any other count makes the device spread the colours across the strands
+		// in a way that does not match what was sent, and above 20 it blanks entirely. LedFx report
+		// the same ceiling independently: "H70B1 Curtain Lights: ceases to work about 20".
+		ledCount: 20,
+		// Separate hanging strands, so blending fades across a gap that is not there in the light.
+		blendSegments: false
+	},
 	H61D5: {
 		name: "RGBIC Neon Lights 2",
-		deviceImage: "",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61d5.png",
 		sku: "H61D5",
 		state: 1,
 		supportRazer: true,
 		supportDreamView: true,
-		ledCount: 7
+		ledCount: 68,
+		hasVariableLedCount: true
+	},
+	H6167: {
+		name: "RGBIC TV Light Bars",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6168.png",
+		sku: "H6167",
+		state: 1,
+		supportDreamView: true,
+		supportRazer: true,
+		ledCount: 10
 	},
 	H6168: {
 		name: "RGBIC TV Light Bars",
-		deviceImage: "",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h6168.png",
 		sku: "H6168",
 		state: 1,
 		supportRazer: true,
@@ -1300,6 +1963,105 @@ const GoveeDeviceLibrary = {
 				ledPositions: [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [0, 8], [0, 9]],
 			},
 		]
-	}
-
+	},
+	H7075: {
+		name: "Govee Outdoor Wall Light, 1500LM",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h7075.png",
+		sku: "H7075",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 10
+	},
+	H606A: {
+		name: "Hex Glide Ultra",
+		deviceImage : "https://assets.signalrgb.com/devices/brands/govee/wifi/h606a.png",
+		sku: "H606A",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 10, // Linked panels that goes up to 21 per controller
+		hasVariableLedCount: true
+	},
+	H8022 : {
+		name: "RGBIC Table Lamp",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h8022.png",
+		sku: "H8022",
+		state: 1,
+		supportDreamView: true,
+		supportRazer: true,
+		ledCount: 15
+	},
+	H8072: {
+		name: "RGBIC Floor Lamp",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h8072.png",
+		sku: "H8072",
+		state: 1,
+		supportDreamView: true,
+		supportRazer: true,
+		ledCount: 15
+	},
+	H7053: {
+		name: "Outdoor Ground Lights 2",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h7053.png",
+		sku: "H7053",
+		state: 1,
+		supportRazer: false,
+		supportDreamView: true,
+		ledCount: 30
+	},
+	H61B3: {
+		name: "3m RGBIC LED Strip Light with Cover",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61b2.png",
+		sku: "H61B3",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 30
+	},
+	H7039: {
+		name: "Smart Outdoor String Lights 2",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h7039.png",
+		sku: "H7039",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 45
+	},
+	H60A1: {
+		name: "Smart Ceiling Light",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h60a1.png",
+		sku: "H60A1",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 13
+	},
+	H702A: {
+		name: "S14 Bulb Outdoor String Lights 2",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h702a.png",
+		sku: "H702A",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 15
+	},
+	H61E6: {
+		name: "COB LED Strip Light Pro",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h61e6.png",
+		sku: "H61E6",
+		state: 1,
+		supportRazer: true,
+		supportDreamView: true,
+		ledCount: 60
+	},
+	H612C: {
+		name: " RGBIC LED Strip Lights With Protective Coating",
+		deviceImage: "https://assets.signalrgb.com/devices/brands/govee/wifi/h612c.png",
+		sku: "H612C",
+		state: 1,
+		supportRazer: false,
+		supportDreamView: true,
+		ledCount: 20
+	},
 };
