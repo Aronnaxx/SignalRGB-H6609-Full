@@ -21,6 +21,7 @@ blendSegments:readonly
 variableLedCount:readonly
 streamKeepalive:readonly
 statusQuery:readonly
+forceReconnect:readonly
 */
 export function ControllableParameters() {
 	return [
@@ -30,6 +31,7 @@ export function ControllableParameters() {
 		{property:"TurnOffOnShutdown", group:"settings", label:"Turn off when ignored", description: "This turns off the device when it is ignored or disabled, and when the app shuts down", type:"boolean", default:"false"},
 		{property:"protocolSelect", group:"settings", label:"Protocol", description: "Determines which protocol will be used to control the device. Auto picks the best protocol this device is known to support, and is the right choice unless you're troubleshooting. (Not all protocols works on a device)", type:"combobox", values:["Auto", "Dreamview", "RazerV1", "RazerV2", "Static"], default:"Auto"},
 		{property:"blendSegments", group:"settings", label:"Blend Between Segments", description: "Lets the device fade between the colors we send instead of applying each one to its own segment. Auto follows what the device library says. Softer on a strip, wrong on anything built from separate physical pieces like a curtain, where it blends across a gap that is not there in the light.", type:"combobox", values:["Auto", "On", "Off"], default:"Auto"},
+		{property:"forceReconnect", group:"settings", label:"Force Reconnect", description: "Toggle this switch to immediately reset the UDP socket and force a reconnect to the device", type:"boolean", default:"false"},
 		// TEMPORARY, both of these. They exist to settle whether stream mode really auto-disables in
 		// the firmware, which is the only thing that ever justified paying a dropped frame on a timer.
 		// Remove both once that is known -- see the comment on MaintainStreamingMode.
@@ -165,14 +167,24 @@ export function Render(){
 	// 	device.log(`Render tick ${renderCount}.`);
 	// }
 
+	// If the socket was disconnected or had an error, attempt to reconnect and pause Render
+	if(UDPServer !== undefined && !UDPServer.connected){
+		sawConnectedSocket = false;
+		UDPServer.attemptReconnect();
+		device.pause(50);
+		return;
+	}
+
 	// Initialize starts the socket and then sends the setup commands straight away, before
 	// connect() has reported back, so they can go out on a socket that is not ready yet.
 	// Watch for the connection landing instead and assert them then. A flag check per frame,
 	// no blocking, and it works no matter how long the socket takes.
 	if(!sawConnectedSocket && UDPServer !== undefined && UDPServer.connected){
 		sawConnectedSocket = true;
+		device.log("Socket connected! Initializing device stream...");
 		govee.setDeviceState(true);
 		govee.SetStreamingMode(true);
+		lastStatusReply = Date.now();
 	}
 
 	MaintainStreamingMode();
@@ -236,7 +248,18 @@ function MaintainStreamingMode(){
 		return;
 	}
 
-	if(Date.now() - lastStatusReply < StreamLostAfter){
+	const timeSinceReply = Date.now() - lastStatusReply;
+	if(timeSinceReply < StreamLostAfter){
+		return;
+	}
+
+	// If the device has gone silent for over 15 seconds, re-asserting streaming mode alone
+	// has not recovered it. Force a fresh socket reconnect.
+	if(timeSinceReply > 15000 && UDPServer !== undefined){
+		device.log(`Device silent for ${timeSinceReply}ms. Forcing socket reconnection...`);
+		lastStatusReply = Date.now();
+		sawConnectedSocket = false;
+		UDPServer.reconnect();
 		return;
 	}
 
@@ -379,6 +402,16 @@ function ConfigureDevice(GoveeDeviceInfo){
 /** Called by the host when the user changes the Segment Count setting on a device that has one. */
 export function onvariableLedCountChanged(){
 	SetLedCount(variableLedCount);
+}
+
+/** Called by the host when the user toggles the Force Reconnect setting. */
+export function onforceReconnectChanged(){
+	device.log("User triggered Force Reconnect.");
+	sawConnectedSocket = false;
+	lastStatusReply = Date.now();
+	if(UDPServer !== undefined){
+		UDPServer.reconnect();
+	}
 }
 
 function GetAutoProtocol(GoveeDeviceInfo){
@@ -1106,7 +1139,7 @@ class GoveeProtocol {
 		if (statusQuery && now - this.lastPacket > 1000) {
 			UDPServer.send(JSON.stringify({
 				msg: {
-					cmd: "status",
+					cmd: "devStatus",
 					data: {}
 				}
 			}));
@@ -1165,6 +1198,10 @@ class UdpSocketServer{
 		this.ipToConnectTo = args?.ip ?? "239.255.255.250";
 		this.isDiscoveryServer = args?.isDiscoveryServer ?? false;
 		this.connected = false;
+		this.isReconnecting = false;
+		this.lastReconnectAttempt = 0;
+		this.lastLoggedError = 0;
+		this.lastErrorCode = null;
 
 		this.log = (msg) => { this.isDiscoveryServer ? service.log(msg) : device.log(msg); };
 
@@ -1180,16 +1217,26 @@ class UdpSocketServer{
 			this.server = udp.createSocket();
 		}
 
-		this.server.write(packet, address, port);
+		try {
+			this.server.write(packet, address, port);
+		} catch(e) {
+			this.log(`Write error: ${e}`);
+		}
 	}
 
 	send(packet) {
-		if(!this.server) {
-			this.server = udp.createSocket();
-			this.log("Defining new UDP Socket so we can send data.");
+		if(!this.server || !this.connected) {
+			if(!this.isDiscoveryServer && !this.isReconnecting) {
+				this.attemptReconnect();
+			}
+			return;
 		}
 
-		this.server.send(packet);
+		try {
+			this.server.send(packet);
+		} catch(e) {
+			this.log(`Send error: ${e}`);
+		}
 	}
 
 	start(){
@@ -1204,19 +1251,52 @@ class UdpSocketServer{
 			this.server.bind(this.listenPort);
 			this.server.connect(this.ipToConnectTo, this.broadcastPort);
 		}
-	};
+	}
 
 	stop(){
 		this.connected = false;
 
 		if(this.server) {
-			this.server.disconnect();
-			this.server.close();
+			try {
+				this.server.disconnect();
+			} catch(e) {}
+			try {
+				this.server.close();
+			} catch(e) {}
+			this.server = null;
 		}
+	}
+
+	reconnect(){
+		this.log("Reconnecting UDP Socket...");
+		this.connected = false;
+		this.isReconnecting = false;
+		this.lastReconnectAttempt = Date.now();
+		this.stop();
+		this.start();
+	}
+
+	attemptReconnect(){
+		if(this.isDiscoveryServer || this.connected) {
+			return;
+		}
+
+		const now = Date.now();
+		if(now - this.lastReconnectAttempt < 2000) {
+			return; // Rate limit reconnects to once every 2 seconds
+		}
+
+		this.lastReconnectAttempt = now;
+		this.isReconnecting = true;
+		this.log(`Attempting to reconnect UDP socket to ${this.ipToConnectTo}:${this.broadcastPort}...`);
+		this.stop();
+		this.start();
 	}
 
 	onConnection(){
 		this.connected = true;
+		this.isReconnecting = false;
+		this.lastErrorCode = null;
 		this.log('Connected to remote socket!');
 		this.log("Socket information:");
 		this.log(this.server.remoteAddress(), {pretty: true});
@@ -1237,7 +1317,7 @@ class UdpSocketServer{
 				this.log('Error sending data to remote socket');
 			}
 		}
-	};
+	}
 
 	onListenerResponse(msg) {
 		this.log('Data received from client');
@@ -1250,7 +1330,8 @@ class UdpSocketServer{
 
 		// Check if the socket is bound (no error means it's bound but we'll check anyway)
 		this.log(`Socket Bound: ${this.server.state === this.server.BoundState}`);
-	};
+	}
+
 	onMessage(msg){
 		if(this.isDiscoveryServer) {
 			this.log('Data received from client');
@@ -1265,11 +1346,32 @@ class UdpSocketServer{
 		// once a second, so they are handed to the callback rather than logged -- the handler decides
 		// what is worth saying.
 		this.responseCallbackFunction(msg);
-	};
+	}
+
 	onError(code, message){
-		this.log(`Error: ${code} - ${message}`);
-		this.server.close(); // We're done here
-	};
+		const now = Date.now();
+		// Throttle error logging so it doesn't flood the log 100 times per second
+		if(this.lastErrorCode !== code || now - this.lastLoggedError > 3000) {
+			this.log(`Error: ${code} - ${message}`);
+			this.lastLoggedError = now;
+			this.lastErrorCode = code;
+		}
+
+		this.connected = false;
+		this.isReconnecting = false;
+		sawConnectedSocket = false;
+
+		if(this.server) {
+			try {
+				this.server.close();
+			} catch(e) {}
+			this.server = null;
+		}
+
+		if(!this.isDiscoveryServer) {
+			this.attemptReconnect();
+		}
+	}
 }
 
 class IPCache{
